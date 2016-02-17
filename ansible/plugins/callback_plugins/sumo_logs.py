@@ -3,6 +3,20 @@
 #   https://github.com/petems/ansible-json.git
 #   https://github.com/jlafon/ansible-profile
 #   https://github.com/kalosoid/ansible-sumo-logs
+#   https://github.com/ansible/ansible/blob/devel/lib/ansible/plugins/callback/default.py
+#
+# There are attempts here at making code more python3
+# compatible. Keep in mind please!
+# This version by Cody Rucks
+
+from __future__ import (absolute_import, division, print_function)
+__metaclass__ = type
+
+from ansible import constants as C
+from ansible.plugins.callback import CallbackBase
+from ansible import utils
+from ansible.utils.color import colorize, hostcolor
+
 
 import json
 import logging
@@ -12,9 +26,11 @@ import platform
 import time
 from datetime import datetime, timedelta
 
+
+# Special note: This is still a WIP. Issues currently with
+# grabbing the playbook name! Everything else is working so far.
+
 log = logging.getLogger("ansible")
-#fh = logging.FileHandler('sample.log')
-#log.addHandler(fh)
 
 
 def json_log(res, uuid, play, role, task, state):
@@ -34,10 +50,19 @@ def json_log(res, uuid, play, role, task, state):
             log.info(json.dumps(res, sort_keys=True))
 
 
-class CallbackModule(object):
+class CallbackModule(CallbackBase):
 
-    start_time = datetime.now()
-    uuid = None
+    '''
+    This is the callback will create logs for sumo logic.
+    It will adjust the logging to another directory and then
+    those json logs can be shipped off.
+
+    Structure your logs. Ta-da.
+    '''
+
+    CALLBACK_VERSION = 0.1
+    CALLBACK_TYPE = 'Sumosize the logging'
+    CALLBACK_NAME = 'Sumosize'
 
     def __init__(self):
 
@@ -46,7 +71,7 @@ class CallbackModule(object):
         self.current = None
         self.role = None
         self.task = None
-        self.play = None
+        self.playbook = None
 
         self.uuid = str(uuid.uuid4())
 
@@ -58,111 +83,209 @@ class CallbackModule(object):
         return timedelta.days, timedelta.seconds//3600, minutes, r_seconds
 
     def on_any(self, *args, **kwargs):
-        self.play = self.playbook.filename
+        self.playbook = self.play.playbook
 
         task = getattr(self, 'task', None)
-#        if task:
-#            print "play = %s, role = %s, task = %s, args = %s, kwargs = %s" % (self.play, self.role, self.task,args,kwargs)
 
-    def runner_on_failed(self, host, res, ignore_errors=False):
-        json_log(res, self.uuid, self.play, self.role, self.task,'failed')
+    def v2_runner_on_failed(self, result, ignore_errors=False):
+        delegated_vars = result._result.get('_ansible_delegated_vars', None)
+        if 'exception' in result._result:
+            if self._display.verbosity < 3:
+                # extract just the actual error message from the exception text
+                error = result._result['exception'].strip().split('\n')[-1]
+                msg = "An exception occurred during task execution. To see the full traceback, use -vvv. The error was: %s" % error
+            else:
+                msg = "An exception occurred during task execution. The full traceback is:\n" + result._result['exception']
 
-    def runner_on_ok(self, host, res):
-        json_log(res, self.uuid, self.play, self.role, self.task, 'ok')
+            self._display.display(msg, color=C.COLOR_ERROR)
+            self._display.display(json_log(res, self.uuid, self.playbook, self.role, self.task,'failed'))
 
-    def runner_on_error(self, host, msg, res):
-        res.update({"error-msg":msg})
-        json_log(res, self.uuid, self.play, self.role, self.task,'error')
 
-    def runner_on_skipped(self, host, item=None):
-        pass
+            # finally, remove the exception from the result so it's not shown every time
+            del result._result['exception']
 
-    def runner_on_unreachable(self, host, res):
-        json_log(res, self.uuid, self.play, self.role, self.task,'unreachable')
-
-    def runner_on_no_hosts(self):
-        pass
-
-    def runner_on_async_poll(self, host, res, jid, clock):
-        json_log(res, self.uuid, self.play, self.role, self.task,'async_poll')
-
-    def runner_on_async_ok(self, host, res, jid):
-        json_log(res, self.uuid, self.play, self.role, self.task,'async_ok')
-
-    def runner_on_async_failed(self, host, res, jid):
-        json_log(res, self.uuid, self.play, self.role, self.task,'async_failed')
-
-    def playbook_on_start(self):
-        pass
-
-    def playbook_on_notify(self, host, handler):
-        pass
-
-    def playbook_on_no_hosts_matched(self):
-        pass
-
-    def playbook_on_no_hosts_remaining(self):
-        pass
-
-    def playbook_on_task_start(self, name, is_conditional):
-        #pass
-
-        my_list = name.split("|")
-
-        # Check to see if we are processing a role
-        if len(my_list) == 2:
-            self.role = str.strip(my_list[0])
-            self.task = str.strip(my_list[1])
-
-            # Check to see if we are procesing a new role. If so, calculate the duration of the previous role
-            if self.current is not None and self.current != self.role:
-                self.stats[self.current] = time.time() - self.stats[self.current]
-
-            # Check to see if we are processing a new role. If so, start the timer
-            if self.current is None or self.current != self.role:
-                self.current = self.role 
-                self.stats[self.current] = time.time()
-
-        # We are now processing playbook level tasks
+        if result._task.loop and 'results' in result._result:
+            self._process_items(result)
         else:
-            self.task = str.strip(my_list[0])
-            if self.current != "NULL":
-                self.stats[self.current] = time.time() - self.stats[self.current]
-            self.current = "NULL"
+            if delegated_vars:
+                self._display.display("fatal: [%s -> %s]: FAILED! => %s" % (result._host.get_name(), delegated_vars['ansible_host'], self._dump_results(result._result)), color=C.COLOR_ERROR)
+            else:
+                self._display.display("fatal: [%s]: FAILED! => %s" % (result._host.get_name(), self._dump_results(result._result)), color=C.COLOR_ERROR)
 
-    def playbook_on_vars_prompt(self, varname, private=True, prompt=None, encrypt=None, confirm=False, salt_size=None, salt=None, default=None):
-        pass
+        if result._task.ignore_errors:
+            self._display.display("...ignoring", color=C.COLOR_SKIP)
 
-    def playbook_on_setup(self):
-        pass
+    def v2_runner_on_ok(self, result):
 
-    def playbook_on_import_for_host(self, host, imported_file):
-        pass
+        self._clean_results(result._result, result._task.action)
+        delegated_vars = result._result.get('_ansible_delegated_vars', None)
+        if result._task.action == 'include':
+            return
+        elif result._result.get('changed', False):
+            if delegated_vars:
+                msg = "changed: [%s -> %s]" % (result._host.get_name(), delegated_vars['ansible_host'])
+            else:
+                msg = "changed: [%s]" % result._host.get_name()
+            color = C.COLOR_CHANGED
+        else:
+            if delegated_vars:
+                msg = "ok: [%s -> %s]" % (result._host.get_name(), delegated_vars['ansible_host'])
+            else:
+                msg = "ok: [%s]" % result._host.get_name()
+            color = C.COLOR_OK
 
-    def playbook_on_not_import_for_host(self, host, missing_file):
-        pass
+        if result._task.loop and 'results' in result._result:
+            self._process_items(result)
+        else:
 
-    def playbook_on_play_start(self, name):
-        pass
+            if (self._display.verbosity > 0 or '_ansible_verbose_always' in result._result) and not '_ansible_verbose_override' in result._result:
+                msg += " => %s" % (self._dump_results(result._result),)
+            self._display.display(msg, color=color)
+            self._display.display(json_log(res, self.uuid, self.playbook, self.role, self.task,'ok'))
 
-    def playbook_on_stats(self, stats):
+        self._handle_warnings(result._result)
 
-        self.play = self.playbook.filename
+    def v2_runner_on_skipped(self, result):
+        if C.DISPLAY_SKIPPED_HOSTS:
+            if result._task.loop and 'results' in result._result:
+                self._process_items(result)
+            else:
+                msg = "skipping: [%s]" % result._host.get_name()
+                if (self._display.verbosity > 0 or '_ansible_verbose_always' in result._result) and not '_ansible_verbose_override' in result._result:
+                    msg += " => %s" % self._dump_results(result._result)
+                self._display.display(msg, color=C.COLOR_SKIP)
+                self._display.display(json_log(res, self.uuid, self.playbook, self.role, self.task,'skipped'))
 
-        res = dict([(h, stats.summarize(h)) for h in stats.processed])
+    def v2_runner_on_unreachable(self, result):
+        delegated_vars = result._result.get('_ansible_delegated_vars', None)
+        if delegated_vars:
+            self._display.display("fatal: [%s -> %s]: UNREACHABLE! => %s" % (result._host.get_name(), delegated_vars['ansible_host'], self._dump_results(result._result)), color=C.COLOR_ERROR)
+            self._display.display(json_log(res, self.uuid, self.playbook, self.role, self.task,'unreachable'))
+        else:
+            self._display.display("fatal: [%s]: UNREACHABLE! => %s" % (result._host.get_name(), self._dump_results(result._result)), color=C.COLOR_ERROR)
+            self._display.display(json_log(res, self.uuid, self.playbook, self.role, self.task,'unreachable'))
 
-        end_time = datetime.now()
-        timedelta = end_time - self.start_time
-        duration = timedelta.total_seconds()
+    def v2_playbook_on_no_hosts_matched(self):
+        self._display.display("skipping: no hosts matched", color=C.COLOR_SKIP)
 
-        res.update({"start":str(self.start_time)})
-        res.update({"end":str(end_time)})
-        res.update({"play_duration":duration})
+    def v2_playbook_on_no_hosts_remaining(self):
+        self._display.banner("NO MORE HOSTS LEFT")
 
-        if self.current is not None and self.current != "NULL":
-            # Record the timing of the very last task
-            self.stats[self.current] = time.time() - self.stats[self.current]
+    def v2_playbook_on_task_start(self, task, is_conditional):
+        self._display.banner("TASK [%s]" % task.get_name().strip())
+        if self._display.verbosity > 2:
+            path = task.get_path()
+            if path:
+                self._display.display("task path: %s" % path, color=C.COLOR_DEBUG)
 
-        res.update({"role_duration":self.stats})
-        
-        json_log(res, self.uuid, self.play, self.role, None,'Play Completed')
+    def v2_playbook_on_cleanup_task_start(self, task):
+        self._display.banner("CLEANUP TASK [%s]" % task.get_name().strip())
+
+    def v2_playbook_on_handler_task_start(self, task):
+        self._display.banner("RUNNING HANDLER [%s]" % task.get_name().strip())
+
+    def v2_playbook_on_play_start(self, play):
+        name = play.get_name().strip()
+        if not name:
+            msg = "PLAY"
+        else:
+            msg = "PLAY [%s]" % name
+
+        self._display.banner(msg)
+
+    def v2_on_file_diff(self, result):
+        if result._task.loop and 'results' in result._result:
+            for res in result._result['results']:
+                if 'diff' in res and res['diff']:
+                    diff = self._get_diff(res['diff'])
+                    if diff:
+                        self._display.display(diff)
+        elif 'diff' in result._result and result._result['diff']:
+            diff = self._get_diff(result._result['diff'])
+            if diff:
+                self._display.display(diff)
+
+    def v2_playbook_item_on_ok(self, result):
+
+        delegated_vars = result._result.get('_ansible_delegated_vars', None)
+        if result._task.action == 'include':
+            return
+        elif result._result.get('changed', False):
+            if delegated_vars:
+                msg = "changed: [%s -> %s]" % (result._host.get_name(), delegated_vars['ansible_host'])
+            else:
+                msg = "changed: [%s]" % result._host.get_name()
+            color = C.COLOR_CHANGED
+        else:
+            if delegated_vars:
+                msg = "ok: [%s -> %s]" % (result._host.get_name(), delegated_vars['ansible_host'])
+            else:
+                msg = "ok: [%s]" % result._host.get_name()
+            color = C.COLOR_OK
+
+        msg += " => (item=%s)" % (result._result['item'],)
+
+        if (self._display.verbosity > 0 or '_ansible_verbose_always' in result._result) and not '_ansible_verbose_override' in result._result:
+            msg += " => %s" % self._dump_results(result._result)
+        self._display.display(msg, color=color)
+
+    def v2_playbook_item_on_failed(self, result):
+        delegated_vars = result._result.get('_ansible_delegated_vars', None)
+        if 'exception' in result._result:
+            if self._display.verbosity < 3:
+                # extract just the actual error message from the exception text
+                error = result._result['exception'].strip().split('\n')[-1]
+                msg = "An exception occurred during task execution. To see the full traceback, use -vvv. The error was: %s" % error
+            else:
+                msg = "An exception occurred during task execution. The full traceback is:\n" + result._result['exception']
+
+            self._display.display(msg, color=C.COLOR_ERROR)
+
+            # finally, remove the exception from the result so it's not shown every time
+            del result._result['exception']
+
+        if delegated_vars:
+            self._display.display("failed: [%s -> %s] => (item=%s) => %s" % (result._host.get_name(), delegated_vars['ansible_host'], result._result['item'], self._dump_results(result._result)), color=C.COLOR_ERROR)
+        else:
+            self._display.display("failed: [%s] => (item=%s) => %s" % (result._host.get_name(), result._result['item'], self._dump_results(result._result)), color=C.COLOR_ERROR)
+
+        self._handle_warnings(result._result)
+
+    def v2_playbook_item_on_skipped(self, result):
+        msg = "skipping: [%s] => (item=%s) " % (result._host.get_name(), result._result['item'])
+        if (self._display.verbosity > 0 or '_ansible_verbose_always' in result._result) and not '_ansible_verbose_override' in result._result:
+            msg += " => %s" % self._dump_results(result._result)
+        self._display.display(msg, color=C.COLOR_SKIP)
+
+    def v2_playbook_on_include(self, included_file):
+        msg = 'included: %s for %s' % (included_file._filename, ", ".join([h.name for h in included_file._hosts]))
+        color = C.COLOR_SKIP
+        self._display.display(msg, color=C.COLOR_SKIP)
+
+    def v2_playbook_on_stats(self, stats):
+        self._display.banner("PLAY RECAP")
+
+        hosts = sorted(stats.processed.keys())
+        for h in hosts:
+            t = stats.summarize(h)
+
+            self._display.display(u"%s : %s %s %s %s" % (
+                hostcolor(h, t),
+                colorize(u'ok', t['ok'], C.COLOR_OK),
+                colorize(u'changed', t['changed'], C.COLOR_CHANGED),
+                colorize(u'unreachable', t['unreachable'], C.COLOR_UNREACHABLE),
+                colorize(u'failed', t['failures'], C.COLOR_ERROR)),
+                screen_only=True
+            )
+
+            self._display.display(u"%s : %s %s %s %s" % (
+                hostcolor(h, t, False),
+                colorize(u'ok', t['ok'], None),
+                colorize(u'changed', t['changed'], None),
+                colorize(u'unreachable', t['unreachable'], None),
+                colorize(u'failed', t['failures'], None)),
+                log_only=True
+            )
+
+        self._display.display("", screen_only=True)
+        self._display.display(json_log(res, self.uuid, self.play, self.role, None,'Play Completed'))
